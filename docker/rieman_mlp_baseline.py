@@ -166,35 +166,82 @@ def open_cache(cdir, meta):
     return tuple(np.load(os.path.join(cdir, f"{nm}.npy"), mmap_mode="r")[:n] for nm in ("X", "Y", "C", "I"))
 
 
+LOG_COLS = [0, 4, 8, 12]   # density_L, p_L, density_R, p_R  (columns of X)
+
+
+def log_transform(X):
+    """Return a float64 COPY of X (N,16) with log10 applied to rho and p (L and R).
+    Raises if any of them is not strictly positive (also catches NaN)."""
+    X = np.array(X, dtype=np.float64)
+    c = X[:, LOG_COLS]
+    if not np.all(c > 0):
+        bad = ~(c > 0)
+        raise ValueError(f"log10 needs strictly positive rho/p: {int(bad.any(1).sum())} bad rows "
+                         f"(per column [rho_L, p_L, rho_R, p_R]: {bad.sum(0).tolist()})")
+    X[:, LOG_COLS] = np.log10(c)
+    return X
+
+
 def compute_stats(Xs, Ys, chunk=2_000_000):
-    """Two-pass mean/std over the TRAIN caches (streamed). L and R states share stats."""
+    """Two-pass mean/std over the TRAIN caches (streamed), computed AFTER the log10 transform
+    of rho and p. L and R states share the same statistics. Targets are standardized per component."""
     sx = np.zeros(8); sy = np.zeros(8); nx = ny = 0
     for X, Y in zip(Xs, Ys):
         for s in range(0, len(X), chunk):
-            x = np.asarray(X[s:s + chunk], dtype=np.float64); y = np.asarray(Y[s:s + chunk], dtype=np.float64)
+            x = log_transform(X[s:s + chunk]); y = np.asarray(Y[s:s + chunk], dtype=np.float64)
             sx += x[:, :8].sum(0) + x[:, 8:].sum(0); nx += 2 * len(x)
             sy += y.sum(0); ny += len(y)
     xm, ym = sx / nx, sy / ny
     vx = np.zeros(8); vy = np.zeros(8)
     for X, Y in zip(Xs, Ys):
         for s in range(0, len(X), chunk):
-            x = np.asarray(X[s:s + chunk], dtype=np.float64); y = np.asarray(Y[s:s + chunk], dtype=np.float64)
+            x = log_transform(X[s:s + chunk]); y = np.asarray(Y[s:s + chunk], dtype=np.float64)
             vx += ((x[:, :8] - xm) ** 2).sum(0) + ((x[:, 8:] - xm) ** 2).sum(0)
             vy += ((y - ym) ** 2).sum(0)
     return xm, np.sqrt(vx / nx), ym, np.sqrt(vy / ny)
 
 
 class Normalizer:
+    """Input : [log10 on rho, p] -> StandardScaler (shared by W_L and W_R).
+       Output: StandardScaler on each of the 8 flux components (F_Br included)."""
     def __init__(self, xm, xs, ym, ys):
-        guard = lambda s: np.where(s < 1e-12 * max(s.max(), 1e-30), 1.0, s)   # constant channels (F_Br == 0)
-        self.xm, self.xs, self.ym, self.ys = xm, guard(xs), ym, guard(ys)
-        self.xm32 = np.tile(self.xm, 2).astype(np.float32); self.xs32 = np.tile(self.xs, 2).astype(np.float32)
-        self.ym32 = self.ym.astype(np.float32);             self.ys32 = self.ys.astype(np.float32)
+        def guard(s, what):
+            bad = ~np.isfinite(s) | (s < 1e-30)          # only truly constant channels
+            if bad.any():
+                print(f"[scaler] WARNING: zero std in {what} channel(s) {np.where(bad)[0].tolist()} -> using 1.0")
+            return np.where(bad, 1.0, s)
+        self.xm, self.xs = np.asarray(xm, np.float64), guard(np.asarray(xs, np.float64), "input")
+        self.ym, self.ys = np.asarray(ym, np.float64), guard(np.asarray(ys, np.float64), "target")
+        self.xm16, self.xs16 = np.tile(self.xm, 2), np.tile(self.xs, 2)
+        self.ym32 = self.ym.astype(np.float32); self.ys32 = self.ys.astype(np.float32)
+        print("[scaler] input  mean (log rho, Vr, Vt, Vp, log p, Br, Bt, Bp):", np.array2string(self.xm, precision=4))
+        print("[scaler] input  std                                         :", np.array2string(self.xs, precision=4))
+        print("[scaler] target mean:", np.array2string(self.ym, precision=4))
+        print("[scaler] target std :", np.array2string(self.ys, precision=4))
 
-    def x(self, X):  return (np.asarray(X, dtype=np.float32) - self.xm32) / self.xs32
-    def y(self, Y):  return (np.asarray(Y, dtype=np.float32) - self.ym32) / self.ys32
+    def x(self, X):
+        """raw (N,16) [W_L, W_R] -> model input (float32). Checks rho, p > 0 before the log."""
+        return ((log_transform(X) - self.xm16) / self.xs16).astype(np.float32)
+
+    def x_inv(self, Xn):
+        Z = np.asarray(Xn, np.float64) * self.xs16 + self.xm16
+        Z[:, LOG_COLS] = 10.0 ** Z[:, LOG_COLS]
+        return Z
+
+    def y(self, Y):      return ((np.asarray(Y, np.float64) - self.ym) / self.ys).astype(np.float32)
     def y_inv(self, Yn): return np.asarray(Yn, dtype=np.float64) * self.ys + self.ym
-    def state(self): return dict(xm=self.xm, xs=self.xs, ym=self.ym, ys=self.ys)
+
+    def state(self):
+        return dict(xm=self.xm, xs=self.xs, ym=self.ym, ys=self.ys, log_cols=LOG_COLS)
+
+    def save(self, path):
+        np.savez(path, xm=self.xm, xs=self.xs, ym=self.ym, ys=self.ys, log_cols=np.array(LOG_COLS))
+
+    @classmethod
+    def load(cls, path):
+        d = np.load(path)
+        assert list(d["log_cols"]) == LOG_COLS
+        return cls(d["xm"], d["xs"], d["ym"], d["ys"])
 
 
 # --------------------------------------------------------------------------- #
@@ -561,6 +608,8 @@ def main():
 
     print("[stats] computing normalization from TRAIN only ...")
     norm = Normalizer(*compute_stats(Xtr, Ytr))
+
+    norm.save(f"{a.out}/scalers.npz")          # <- new: standalone scalers for inference
 
     seg_tr = min(a.seg, min(map(len, Xtr))); segs_tr = make_segments(Xtr, seg_tr)
     seg_va = min(a.seg, min(map(len, Xva))); segs_va = make_segments(Xva, seg_va)
