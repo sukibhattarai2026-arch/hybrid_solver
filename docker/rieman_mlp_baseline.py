@@ -11,9 +11,17 @@ MEMORY-LIGHT VERSION (minibatch / streaming)
   X = [WL_density..WL_Bp, WR_density..WR_Bp]  (components 3..18)  ->  16
   Y = [F_density..F_Bp]                       (components 19..26) ->  8
 
+PREPROCESSING (fitted on the TRAIN CRs only, saved to results/scalers.json and mlp_baseline.pt)
+  inputs : log10 on density and pressure (L and R), then StandardScaler; one mean/std per physical
+           variable, shared by W_L and W_R (Vr, Vt, Vp, Br, Bt, Bp: scaler only)
+  outputs: StandardScaler on each of the 8 fluxes individually (including F_Br)
+  predictions are inverse-transformed before all physical errors, plots and the consistency test
+
 Usage:
   python riemann_mlp_baseline.py --train cr1_dir0.h5 cr2_dir0.h5 cr3_dir0.h5 \\
          --val cr4_dir0.h5 --test cr5_dir0.h5 --epochs 50 --samples_per_epoch 5000000
+  # 8 independent MLPs (one per flux, all 16 inputs); add "--inputs own" for the V_r-only-style ablation
+  python riemann_mlp_baseline.py ... --mode separate --out results_separate
   python riemann_mlp_baseline.py --train cr1_dir0.h5 --inspect      # print HDF5 tree
 """
 import argparse, hashlib, json, os, queue, threading, time
@@ -166,82 +174,75 @@ def open_cache(cdir, meta):
     return tuple(np.load(os.path.join(cdir, f"{nm}.npy"), mmap_mode="r")[:n] for nm in ("X", "Y", "C", "I"))
 
 
-LOG_COLS = [0, 4, 8, 12]   # density_L, p_L, density_R, p_R  (columns of X)
+# Preprocessing
+#   inputs : log10 on density and pressure (left AND right), then StandardScaler with ONE
+#            mean/std per physical variable, shared by W_L and W_R.  Vr, Vt, Vp, Br, Bt, Bp: scaler only.
+#   outputs: StandardScaler on each of the 8 fluxes individually (including F_Br).
+#   All parameters are fitted on the TRAIN rows only.
+LOG_VARS = (0, 4)                                              # density, pressure within the 8 variables
+LOG_COLS = tuple(LOG_VARS) + tuple(8 + c for c in LOG_VARS)    # the same for the 16 columns [W_L, W_R]
 
 
-def log_transform(X):
-    """Return a float64 COPY of X (N,16) with log10 applied to rho and p (L and R).
-    Raises if any of them is not strictly positive (also catches NaN)."""
-    X = np.array(X, dtype=np.float64)
-    c = X[:, LOG_COLS]
-    if not np.all(c > 0):
-        bad = ~(c > 0)
-        raise ValueError(f"log10 needs strictly positive rho/p: {int(bad.any(1).sum())} bad rows "
-                         f"(per column [rho_L, p_L, rho_R, p_R]: {bad.sum(0).tolist()})")
-    X[:, LOG_COLS] = np.log10(c)
-    return X
+def log_transform_inputs(X):
+    """float64 copy of X (N,16) with log10 applied to density and pressure (L and R).
+    Raises if any of them is not strictly positive and finite."""
+    Z = np.array(X, dtype=np.float64, copy=True)
+    for c in LOG_COLS:
+        v = Z[:, c]
+        if not (np.all(np.isfinite(v)) and np.all(v > 0)):
+            raise ValueError(f"input column {c} ({'WL_' if c < 8 else 'WR_'}{VARS[c % 8]}) has "
+                             f"non-positive or non-finite values; cannot take log10")
+        Z[:, c] = np.log10(v)
+    return Z
 
 
 def compute_stats(Xs, Ys, chunk=2_000_000):
-    """Two-pass mean/std over the TRAIN caches (streamed), computed AFTER the log10 transform
-    of rho and p. L and R states share the same statistics. Targets are standardized per component."""
+    """Two-pass mean/std over the TRAIN caches (streamed).
+    Inputs are log10-transformed (rho, p) first; L and R states share the statistics."""
     sx = np.zeros(8); sy = np.zeros(8); nx = ny = 0
     for X, Y in zip(Xs, Ys):
         for s in range(0, len(X), chunk):
-            x = log_transform(X[s:s + chunk]); y = np.asarray(Y[s:s + chunk], dtype=np.float64)
+            x = log_transform_inputs(X[s:s + chunk]); y = np.asarray(Y[s:s + chunk], dtype=np.float64)
             sx += x[:, :8].sum(0) + x[:, 8:].sum(0); nx += 2 * len(x)
             sy += y.sum(0); ny += len(y)
     xm, ym = sx / nx, sy / ny
     vx = np.zeros(8); vy = np.zeros(8)
     for X, Y in zip(Xs, Ys):
         for s in range(0, len(X), chunk):
-            x = log_transform(X[s:s + chunk]); y = np.asarray(Y[s:s + chunk], dtype=np.float64)
+            x = log_transform_inputs(X[s:s + chunk]); y = np.asarray(Y[s:s + chunk], dtype=np.float64)
             vx += ((x[:, :8] - xm) ** 2).sum(0) + ((x[:, 8:] - xm) ** 2).sum(0)
             vy += ((y - ym) ** 2).sum(0)
     return xm, np.sqrt(vx / nx), ym, np.sqrt(vy / ny)
 
 
 class Normalizer:
-    """Input : [log10 on rho, p] -> StandardScaler (shared by W_L and W_R).
-       Output: StandardScaler on each of the 8 flux components (F_Br included)."""
+    """x(): raw [W_L, W_R] (N,16) -> log10(rho, p) -> standardize -> float32.
+       y(): raw flux (N,8) -> standardize.   y_inv(): standardized prediction -> physical flux.
+       state()/from_state(): save and restore the fitted scalers for inference."""
     def __init__(self, xm, xs, ym, ys):
-        def guard(s, what):
-            bad = ~np.isfinite(s) | (s < 1e-30)          # only truly constant channels
+        def safe(sd, what):                              # only guard exactly-degenerate std
+            bad = ~(np.isfinite(sd) & (sd > 0))
             if bad.any():
-                print(f"[scaler] WARNING: zero std in {what} channel(s) {np.where(bad)[0].tolist()} -> using 1.0")
-            return np.where(bad, 1.0, s)
-        self.xm, self.xs = np.asarray(xm, np.float64), guard(np.asarray(xs, np.float64), "input")
-        self.ym, self.ys = np.asarray(ym, np.float64), guard(np.asarray(ys, np.float64), "target")
-        self.xm16, self.xs16 = np.tile(self.xm, 2), np.tile(self.xs, 2)
-        self.ym32 = self.ym.astype(np.float32); self.ys32 = self.ys.astype(np.float32)
-        print("[scaler] input  mean (log rho, Vr, Vt, Vp, log p, Br, Bt, Bp):", np.array2string(self.xm, precision=4))
-        print("[scaler] input  std                                         :", np.array2string(self.xs, precision=4))
-        print("[scaler] target mean:", np.array2string(self.ym, precision=4))
-        print("[scaler] target std :", np.array2string(self.ys, precision=4))
+                print(f"[scalers] WARNING: zero/invalid std for {what} {np.where(bad)[0].tolist()}; using 1.0")
+            return np.where(bad, 1.0, sd)
+        self.xm, self.xs = np.asarray(xm, dtype=np.float64), safe(np.asarray(xs, dtype=np.float64), "inputs")
+        self.ym, self.ys = np.asarray(ym, dtype=np.float64), safe(np.asarray(ys, dtype=np.float64), "fluxes")
+        self.xm_t, self.xs_t = np.tile(self.xm, 2), np.tile(self.xs, 2)
+        self.ym32, self.ys32 = self.ym.astype(np.float32), self.ys.astype(np.float32)
 
-    def x(self, X):
-        """raw (N,16) [W_L, W_R] -> model input (float32). Checks rho, p > 0 before the log."""
-        return ((log_transform(X) - self.xm16) / self.xs16).astype(np.float32)
-
-    def x_inv(self, Xn):
-        Z = np.asarray(Xn, np.float64) * self.xs16 + self.xm16
-        Z[:, LOG_COLS] = 10.0 ** Z[:, LOG_COLS]
-        return Z
-
-    def y(self, Y):      return ((np.asarray(Y, np.float64) - self.ym) / self.ys).astype(np.float32)
+    def x(self, X):  return ((log_transform_inputs(X) - self.xm_t) / self.xs_t).astype(np.float32)
+    def y(self, Y):  return ((np.asarray(Y, dtype=np.float64) - self.ym) / self.ys).astype(np.float32)
     def y_inv(self, Yn): return np.asarray(Yn, dtype=np.float64) * self.ys + self.ym
 
     def state(self):
-        return dict(xm=self.xm, xs=self.xs, ym=self.ym, ys=self.ys, log_cols=LOG_COLS)
-
-    def save(self, path):
-        np.savez(path, xm=self.xm, xs=self.xs, ym=self.ym, ys=self.ys, log_cols=np.array(LOG_COLS))
+        return dict(xm=self.xm, xs=self.xs, ym=self.ym, ys=self.ys, log10_vars=list(LOG_VARS),
+                    input_names=VARS, flux_names=FLUX_NAMES,
+                    note="x = (log10 on density,pressure; then (x-xm)/xs), same xm/xs for W_L and W_R; "
+                         "y = (F-ym)/ys; invert prediction with F = y*ys + ym")
 
     @classmethod
-    def load(cls, path):
-        d = np.load(path)
-        assert list(d["log_cols"]) == LOG_COLS
-        return cls(d["xm"], d["xs"], d["ym"], d["ys"])
+    def from_state(cls, st):
+        return cls(st["xm"], st["xs"], st["ym"], st["ys"])
 
 
 # --------------------------------------------------------------------------- #
@@ -271,13 +272,33 @@ def physical_flux_r(W, gamma=5 / 3, mu=1.0):
 # --------------------------------------------------------------------------- #
 # Model / loss
 # --------------------------------------------------------------------------- #
-def make_mlp():
+def _mlp(n_in, n_out):
     return nn.Sequential(
-        nn.Linear(16, 128), nn.SiLU(),
+        nn.Linear(n_in, 128), nn.SiLU(),
         nn.Linear(128, 128), nn.SiLU(),
         nn.Linear(128, 128), nn.SiLU(),
-        nn.Linear(128, 8),
+        nn.Linear(128, n_out),
     )
+
+
+class SeparateMLPs(nn.Module):
+    """8 independent MLPs, one per flux (no shared weights); forward returns (N, 8).
+    inputs='all': every net sees all 16 inputs  [WL_*, WR_*].
+    inputs='own': net j sees only its own variable pair [WL_j, WR_j]
+                  (F_Vr <- WL_Vr, WR_Vr, ...): an ablation, NOT expected to work well."""
+    def __init__(self, inputs="all"):
+        super().__init__()
+        self.cols = [list(range(16)) if inputs == "all" else [j, 8 + j] for j in range(8)]
+        self.nets = nn.ModuleList([_mlp(len(c), 1) for c in self.cols])
+
+    def forward(self, x):
+        return torch.cat([net(x[:, c]) for net, c in zip(self.nets, self.cols)], dim=1)
+
+
+def make_model(mode, inputs):
+    if mode == "multi":
+        return _mlp(16, 8)                    # one MLP, 16 -> 8
+    return SeparateMLPs(inputs)               # 8 MLPs, each -> 1
 
 
 def rel_l2(pred, y):
@@ -572,6 +593,11 @@ def main():
     ap.add_argument("--bs", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--rel_weight", type=float, default=1.0, help="weight of relL2 term")
+    ap.add_argument("--mode", choices=["multi", "separate"], default="multi",
+                    help="multi: one MLP 16->8.  separate: 8 independent MLPs, one per flux")
+    ap.add_argument("--inputs", choices=["all", "own"], default="all",
+                    help="separate mode only. all: each net sees all 16 inputs. "
+                         "own: net j sees only [WL_j, WR_j] (e.g. F_Vr <- WL_Vr, WR_Vr)")
     ap.add_argument("--samples_per_epoch", type=int, default=0,
                     help="random rows seen per epoch (0 = all training rows)")
     ap.add_argument("--seg", type=int, default=4096, help="rows per contiguous read segment")
@@ -588,6 +614,8 @@ def main():
         inspect_h5(a.train[0]); return
     if not (a.val and a.test):
         raise SystemExit("need --train, --val and --test (one dir_0 file per CR)")
+    if a.inputs == "own" and a.mode != "separate":
+        raise SystemExit("--inputs own only makes sense with --mode separate")
 
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed); np.random.seed(a.seed)
@@ -608,8 +636,14 @@ def main():
 
     print("[stats] computing normalization from TRAIN only ...")
     norm = Normalizer(*compute_stats(Xtr, Ytr))
-
-    norm.save(f"{a.out}/scalers.npz")          # <- new: standalone scalers for inference
+    print("[scalers] inputs (shared by W_L and W_R; log10 applied first where marked)")
+    for i, v in enumerate(VARS):
+        print(f"   {('log10 ' if i in LOG_VARS else '') + v:<14} mean {norm.xm[i]: .4e}   std {norm.xs[i]:.4e}")
+    print("[scalers] flux targets (each standardized individually)")
+    for i, v in enumerate(FLUX_NAMES):
+        print(f"   {v:<14} mean {norm.ym[i]: .4e}   std {norm.ys[i]:.4e}")
+    json.dump({k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in norm.state().items()},
+              open(f"{a.out}/scalers.json", "w"), indent=2)
 
     seg_tr = min(a.seg, min(map(len, Xtr))); segs_tr = make_segments(Xtr, seg_tr)
     seg_va = min(a.seg, min(map(len, Xva))); segs_va = make_segments(Xva, seg_va)
@@ -627,11 +661,20 @@ def main():
     ym = torch.tensor(norm.ym32, device=device); ys = torch.tensor(norm.ys32, device=device)
 
     def loss_fn(pred_n, y_n):
+        if a.mode == "separate":
+            # each flux has its own loss (the nets share nothing): MSE (normalized) + relL2 (physical), summed
+            mse = ((pred_n - y_n) ** 2).mean(0)                                   # (8,)
+            pr, yt = pred_n * ys + ym, y_n * ys + ym
+            eps = 1e-3 * ys * (len(y_n) ** 0.5)                                   # scale-aware floor
+            rel = torch.linalg.norm(pr - yt, dim=0) / (torch.linalg.norm(yt, dim=0) + eps)
+            return (mse + a.rel_weight * rel).sum(), mse.mean(), rel.mean()
         mse = torch.mean((pred_n - y_n) ** 2)                       # normalized space
         rel = rel_l2(pred_n * ys + ym, y_n * ys + ym)               # physical space
         return mse + a.rel_weight * rel, mse, rel
 
-    model = make_mlp().to(device)
+    model = make_model(a.mode, a.inputs).to(device)
+    print(f"[model] mode={a.mode}, inputs={a.inputs if a.mode == 'separate' else 'all (16)'}, "
+          f"{sum(p_.numel() for p_ in model.parameters())} parameters")
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
 
@@ -654,7 +697,9 @@ def main():
         sched.step()
         model.eval()
         with torch.no_grad():
-            vl, vm, vr = loss_fn(model(xv), yv)
+            pv = model(xv)
+            vl, vm, vr = loss_fn(pv, yv)
+            per_t = ((pv - yv) ** 2).mean(0).cpu().numpy()          # val MSE per flux (normalized)
         hist["train"].append(tot.item() / seen); hist["val"].append(vl.item())
         hist["val_mse"].append(vm.item()); hist["val_rel"].append(vr.item())
         if vl.item() < best:
@@ -662,8 +707,11 @@ def main():
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
         print(f"ep {ep:4d}  train {hist['train'][-1]:.4e}  val {vl.item():.4e}  "
               f"(mse {vm.item():.3e}, relL2 {vr.item():.3e})  {time.time() - t0:.0f}s")
+        print("      val nMSE per flux " + "  ".join(f"{n.replace('F_', '')}={v:.2e}"
+                                                    for n, v in zip(FLUX_NAMES, per_t)))
     model.load_state_dict(best_state)
-    torch.save({"model": best_state, "norm": norm.state()}, f"{a.out}/mlp_baseline.pt")
+    torch.save({"model": best_state, "norm": norm.state(), "mode": a.mode, "inputs": a.inputs},
+               f"{a.out}/mlp_baseline.pt")
 
     fig, ax = plt.subplots(1, 2, figsize=(11, 4))
     ax[0].semilogy(hist["train"], label="train"); ax[0].semilogy(hist["val"], label="val")
