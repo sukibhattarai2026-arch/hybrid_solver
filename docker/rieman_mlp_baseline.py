@@ -100,7 +100,7 @@ def build_cache(h5_path, cache_root, rebuild=False, skip_r=0):
             offs = np.r_[0, np.cumsum((hi - lo + 1).prod(1) * ncomp)]
         ghi = hi.max(0)
         i_start = int(lo[:, 0].min()) + skip_r                  # first radial index that is kept
- 
+
         # per box: ghost width g, face extension, array dims in file, dims we keep
         plans = []
         for b in range(nb):
@@ -125,12 +125,12 @@ def build_cache(h5_path, cache_root, rebuild=False, skip_r=0):
             g0, d0_, k0_ = plans[0]
             print(f"[cache] {nb} boxes; box0: ghost={g0}, file dims={d0_.tolist()}, kept dims={k0_.tolist()}")
         nmax = int(sum(int(np.prod(p[2])) for p in plans))
- 
+
         mk = lambda name, shape, dt: np.lib.format.open_memmap(
             os.path.join(cdir, name + ".npy"), mode="w+", dtype=dt, shape=shape)
         Xm, Ym = mk("X", (nmax, 16), np.float32), mk("Y", (nmax, 8), np.float32)
         Cm, Im = mk("C", (nmax, 3), np.float64), mk("I", (nmax, 3), np.int32)
- 
+
         p = 0
         for b in range(nb):
             g, d, keep = plans[b]
@@ -170,6 +170,7 @@ def build_cache(h5_path, cache_root, rebuild=False, skip_r=0):
     print(f"[cache] done: {meta['n']} valid rows ({meta['dropped']} dropped: non-finite or rho/p<=0), "
           f"{time.time() - t0:.0f}s")
     return cdir, meta
+
 
 def open_cache(cdir, meta):
     n = meta["n"]
@@ -411,6 +412,22 @@ def plot_error_vs_radius(r_i, err2_i, ref2_i, rms, path, title):
     fig.suptitle(title); fig.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
 
 
+def plot_error_vs_jump(jedges, jcnt, jerr2, jref2, jcen2, path):
+    """Relative L2 error (all 8 fluxes) binned by the size of the L/R jump: MLP vs central-flux baseline."""
+    c = 0.5 * (jedges[:-1] + jedges[1:])
+    ok = jcnt > 0
+    mlp = np.sqrt(jerr2) / (np.sqrt(jref2) + EPS)
+    cen = np.sqrt(jcen2) / (np.sqrt(jref2) + EPS)
+    fig, ax = plt.subplots(1, 2, figsize=(13, 4.5))
+    ax[0].semilogy(c[ok], mlp[ok], "o-", label="MLP")
+    ax[0].semilogy(c[ok], cen[ok], "s--", label="central flux (no dissipation)")
+    ax[0].set_xlabel("log10 jump  ||W_R - W_L|| (standardized inputs)"); ax[0].set_ylabel("relative L2 error")
+    ax[0].legend(); ax[0].grid(alpha=0.3); ax[0].set_title("error vs L/R jump size")
+    ax[1].bar(c, jcnt, width=jedges[1] - jedges[0]); ax[1].set_yscale("log")
+    ax[1].set_xlabel("log10 jump"); ax[1].set_ylabel("number of faces"); ax[1].set_title("how many faces per jump size")
+    fig.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
+
+
 def _imshow_triplet(fig, axes_row, g, p_, name, extent, xl, yl):
     vmin, vmax = np.nanmin(g), np.nanmax(g)
     if vmin == vmax:
@@ -490,6 +507,9 @@ def evaluate(predict_fn, norm, cache, meta, a, outdir):
     r_of_i = np.full(n_i, np.nan)
     par, parc = [], []
     subA, subB = [], []
+    Tcen = dict(err2=np.zeros(8))
+    jedges = np.linspace(-6, 2, 33); nj = len(jedges) - 1
+    jcnt, jerr2, jref2, jcen2 = np.zeros(nj), np.zeros(nj), np.zeros(nj), np.zeros(nj)
     Ehist = np.zeros(len(edges) - 1); Esum = 0.0; Emax = 0.0; nE = 0
     same_n, same_err2, same_ref2 = 0, 0.0, 0.0
 
@@ -501,12 +521,24 @@ def evaluate(predict_fn, norm, cache, meta, a, outdir):
         r_of_i[ii] = c[:, 0]
 
         # ---- test-set prediction ----
-        pred = norm.y_inv(predict_fn(norm.x(x)))
+        xn = norm.x(x)
+        pred = norm.y_inv(predict_fn(xn))
         err = pred - y
         T["err2"] += (err ** 2).sum(0); T["ref2"] += (y ** 2).sum(0); T["sg"] += y.sum(0)
         for k in range(8):
             err2_i[:, k] += np.bincount(ii, weights=err[:, k] ** 2, minlength=n_i)
             ref2_i[:, k] += np.bincount(ii, weights=y[:, k] ** 2, minlength=n_i)
+        # ---- diagnostics: central-flux baseline (no dissipation) and error vs L/R jump size ----
+        Fc = 0.5 * (physical_flux_r(x[:, :8].astype(np.float64), a.gamma, a.mu)
+                    + physical_flux_r(x[:, 8:].astype(np.float64), a.gamma, a.mu))
+        cen_err = Fc - y
+        Tcen["err2"] += (cen_err ** 2).sum(0)
+        jump = np.linalg.norm(xn[:, 8:] - xn[:, :8], axis=1)
+        jb = np.clip(np.digitize(np.log10(jump + 1e-12), jedges) - 1, 0, nj - 1)
+        jcnt += np.bincount(jb, minlength=nj)
+        jerr2 += np.bincount(jb, weights=(err ** 2).sum(1), minlength=nj)
+        jref2 += np.bincount(jb, weights=(y ** 2).sum(1), minlength=nj)
+        jcen2 += np.bincount(jb, weights=(cen_err ** 2).sum(1), minlength=nj)
         m = rng.random(len(x)) < frac
         par.append((y[m], pred[m]))
         mA = ij[:, 2] == k_sel
@@ -545,6 +577,14 @@ def evaluate(predict_fn, norm, cache, meta, a, outdir):
     # ---------------- test metrics ----------------
     print_metrics("TEST metrics per flux variable", rows_from_sums(T["err2"], T["ref2"], T["sg"], n))
     print(f"\nTEST global relative L2 = {np.sqrt(T['err2'].sum()) / (np.sqrt(T['ref2'].sum()) + EPS):.4e}")
+    tot_mlp = np.sqrt(T["err2"].sum()) / (np.sqrt(T["ref2"].sum()) + EPS)
+    tot_cen = np.sqrt(Tcen["err2"].sum()) / (np.sqrt(T["ref2"].sum()) + EPS)
+    print_metrics("CENTRAL-FLUX baseline  0.5*(F_phys(W_L)+F_phys(W_R)), i.e. NO dissipation",
+                  rows_from_sums(Tcen["err2"], T["ref2"], T["sg"], n))
+    print(f"\nglobal relL2:  MLP {tot_mlp:.4e}   central-flux baseline {tot_cen:.4e}")
+    print("  (the baseline error = share of the reference flux that is solver dissipation, i.e. what the MLP must learn;\n"
+          "   if it is huge the analytic flux convention (gamma, mu, F_p = energy flux, geometry) probably differs)")
+    plot_error_vs_jump(jedges, jcnt, jerr2, jref2, jcen2, f"{outdir}/error_vs_jump.png")
     parity_plot(cat(par, 0), cat(par, 1), "Test set: GT flux (x) vs MLP flux (y)", f"{outdir}/parity_test.png")
     plot_error_vs_radius(r_of_i, err2_i, ref2_i, rms, f"{outdir}/error_vs_radius_test.png",
                          "Test set: relative L2 error vs radius")
@@ -613,20 +653,20 @@ def main():
     ap.add_argument("--mu", type=float, default=1.0, help="mu in B^2/(2 mu); match your code units")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
- 
+
     if a.inspect:
         inspect_h5(a.train[0]); return
     if not (a.val and a.test):
         raise SystemExit("need --train, --val and --test (one dir_0 file per CR)")
     if a.inputs == "own" and a.mode != "separate":
         raise SystemExit("--inputs own only makes sense with --mode separate")
- 
+
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     rng = np.random.default_rng(a.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[device] {device}")
- 
+
     caches = {}
     for name in ("train", "val", "test"):
         caches[name] = []
@@ -637,7 +677,7 @@ def main():
     Xva = [c[0][0] for c in caches["val"]];   Yva = [c[0][1] for c in caches["val"]]
     print(f"[split] train {sum(map(len, Xtr))} rows, val {sum(map(len, Xva))} rows, "
           f"test {sum(len(c[0][0]) for c in caches['test'])} rows")
- 
+
     print("[stats] computing normalization from TRAIN only ...")
     norm = Normalizer(*compute_stats(Xtr, Ytr))
     print("[scalers] inputs (shared by W_L and W_R; log10 applied first where marked)")
@@ -648,22 +688,22 @@ def main():
         print(f"   {v:<14} mean {norm.ym[i]: .4e}   std {norm.ys[i]:.4e}")
     json.dump({k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in norm.state().items()},
               open(f"{a.out}/scalers.json", "w"), indent=2)
- 
+
     seg_tr = min(a.seg, min(map(len, Xtr))); segs_tr = make_segments(Xtr, seg_tr)
     seg_va = min(a.seg, min(map(len, Xva))); segs_va = make_segments(Xva, seg_va)
     n_use = len(segs_tr) if a.samples_per_epoch <= 0 else min(len(segs_tr), -(-a.samples_per_epoch // seg_tr))
     buf_segs = max(1, a.buf_segs)
     print(f"[train] {len(segs_tr)} segments of {seg_tr} rows; {n_use * seg_tr} rows/epoch; "
           f"shuffle buffer {buf_segs * seg_tr} rows")
- 
+
     n_val_segs = min(len(segs_va), -(-a.val_samples // seg_va))
     vsel = segs_va[rng.permutation(len(segs_va))[:n_val_segs]]
     xv, yv = read_segments(Xva, Yva, vsel, seg_va, norm)
     xv, yv = torch.from_numpy(xv).to(device), torch.from_numpy(yv).to(device)
     print(f"[val] fixed subset of {len(xv)} rows")
- 
+
     ym = torch.tensor(norm.ym32, device=device); ys = torch.tensor(norm.ys32, device=device)
- 
+
     def loss_fn(pred_n, y_n):
         if a.mode == "separate":
             # each flux has its own loss (the nets share nothing): MSE (normalized) + relL2 (physical), summed
@@ -675,13 +715,13 @@ def main():
         mse = torch.mean((pred_n - y_n) ** 2)                       # normalized space
         rel = rel_l2(pred_n * ys + ym, y_n * ys + ym)               # physical space
         return mse + a.rel_weight * rel, mse, rel
- 
+
     model = make_model(a.mode, a.inputs).to(device)
     print(f"[model] mode={a.mode}, inputs={a.inputs if a.mode == 'separate' else 'all (16)'}, "
           f"{sum(p_.numel() for p_ in model.parameters())} parameters")
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
- 
+
     hist = {"train": [], "val": [], "val_mse": [], "val_rel": []}
     best, best_state = np.inf, None
     for ep in range(a.epochs):
@@ -716,14 +756,14 @@ def main():
     model.load_state_dict(best_state)
     torch.save({"model": best_state, "norm": norm.state(), "mode": a.mode, "inputs": a.inputs},
                f"{a.out}/mlp_baseline.pt")
- 
+
     fig, ax = plt.subplots(1, 2, figsize=(11, 4))
     ax[0].semilogy(hist["train"], label="train"); ax[0].semilogy(hist["val"], label="val")
     ax[0].set_title("total loss"); ax[0].legend(); ax[0].set_xlabel("epoch")
     ax[1].semilogy(hist["val_mse"], label="val MSE (norm.)"); ax[1].semilogy(hist["val_rel"], label="val relL2")
     ax[1].legend(); ax[1].set_xlabel("epoch")
     fig.tight_layout(); fig.savefig(f"{a.out}/loss_curves.png", dpi=130); plt.close(fig)
- 
+
     predict_fn = lambda xn: predict_norm(model, xn, device)
     for t, (cache, meta) in enumerate(caches["test"]):
         outdir = a.out if len(caches["test"]) == 1 else f"{a.out}/test{t}"
