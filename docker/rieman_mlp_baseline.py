@@ -591,6 +591,8 @@ def main():
     ap.add_argument("--out", default="results")
     ap.add_argument("--cache_dir", default="cache")
     ap.add_argument("--rebuild", action="store_true", help="rebuild the on-disk caches")
+    ap.add_argument("--skip_r", type=int, default=0,
+                    help="skip the first N radial layers (i = i_min .. i_min+N-1); prediction starts at i_min+N")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--bs", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -611,31 +613,31 @@ def main():
     ap.add_argument("--mu", type=float, default=1.0, help="mu in B^2/(2 mu); match your code units")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
-
+ 
     if a.inspect:
         inspect_h5(a.train[0]); return
     if not (a.val and a.test):
         raise SystemExit("need --train, --val and --test (one dir_0 file per CR)")
     if a.inputs == "own" and a.mode != "separate":
         raise SystemExit("--inputs own only makes sense with --mode separate")
-
+ 
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     rng = np.random.default_rng(a.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[device] {device}")
-
+ 
     caches = {}
     for name in ("train", "val", "test"):
         caches[name] = []
         for path in getattr(a, name):
-            cdir, meta = build_cache(path, a.cache_dir, a.rebuild)
+            cdir, meta = build_cache(path, a.cache_dir, a.rebuild, a.skip_r)
             caches[name].append((open_cache(cdir, meta), meta))
     Xtr = [c[0][0] for c in caches["train"]]; Ytr = [c[0][1] for c in caches["train"]]
     Xva = [c[0][0] for c in caches["val"]];   Yva = [c[0][1] for c in caches["val"]]
     print(f"[split] train {sum(map(len, Xtr))} rows, val {sum(map(len, Xva))} rows, "
           f"test {sum(len(c[0][0]) for c in caches['test'])} rows")
-
+ 
     print("[stats] computing normalization from TRAIN only ...")
     norm = Normalizer(*compute_stats(Xtr, Ytr))
     print("[scalers] inputs (shared by W_L and W_R; log10 applied first where marked)")
@@ -646,22 +648,22 @@ def main():
         print(f"   {v:<14} mean {norm.ym[i]: .4e}   std {norm.ys[i]:.4e}")
     json.dump({k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in norm.state().items()},
               open(f"{a.out}/scalers.json", "w"), indent=2)
-
+ 
     seg_tr = min(a.seg, min(map(len, Xtr))); segs_tr = make_segments(Xtr, seg_tr)
     seg_va = min(a.seg, min(map(len, Xva))); segs_va = make_segments(Xva, seg_va)
     n_use = len(segs_tr) if a.samples_per_epoch <= 0 else min(len(segs_tr), -(-a.samples_per_epoch // seg_tr))
     buf_segs = max(1, a.buf_segs)
     print(f"[train] {len(segs_tr)} segments of {seg_tr} rows; {n_use * seg_tr} rows/epoch; "
           f"shuffle buffer {buf_segs * seg_tr} rows")
-
+ 
     n_val_segs = min(len(segs_va), -(-a.val_samples // seg_va))
     vsel = segs_va[rng.permutation(len(segs_va))[:n_val_segs]]
     xv, yv = read_segments(Xva, Yva, vsel, seg_va, norm)
     xv, yv = torch.from_numpy(xv).to(device), torch.from_numpy(yv).to(device)
     print(f"[val] fixed subset of {len(xv)} rows")
-
+ 
     ym = torch.tensor(norm.ym32, device=device); ys = torch.tensor(norm.ys32, device=device)
-
+ 
     def loss_fn(pred_n, y_n):
         if a.mode == "separate":
             # each flux has its own loss (the nets share nothing): MSE (normalized) + relL2 (physical), summed
@@ -673,13 +675,13 @@ def main():
         mse = torch.mean((pred_n - y_n) ** 2)                       # normalized space
         rel = rel_l2(pred_n * ys + ym, y_n * ys + ym)               # physical space
         return mse + a.rel_weight * rel, mse, rel
-
+ 
     model = make_model(a.mode, a.inputs).to(device)
     print(f"[model] mode={a.mode}, inputs={a.inputs if a.mode == 'separate' else 'all (16)'}, "
           f"{sum(p_.numel() for p_ in model.parameters())} parameters")
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
-
+ 
     hist = {"train": [], "val": [], "val_mse": [], "val_rel": []}
     best, best_state = np.inf, None
     for ep in range(a.epochs):
@@ -714,14 +716,14 @@ def main():
     model.load_state_dict(best_state)
     torch.save({"model": best_state, "norm": norm.state(), "mode": a.mode, "inputs": a.inputs},
                f"{a.out}/mlp_baseline.pt")
-
+ 
     fig, ax = plt.subplots(1, 2, figsize=(11, 4))
     ax[0].semilogy(hist["train"], label="train"); ax[0].semilogy(hist["val"], label="val")
     ax[0].set_title("total loss"); ax[0].legend(); ax[0].set_xlabel("epoch")
     ax[1].semilogy(hist["val_mse"], label="val MSE (norm.)"); ax[1].semilogy(hist["val_rel"], label="val relL2")
     ax[1].legend(); ax[1].set_xlabel("epoch")
     fig.tight_layout(); fig.savefig(f"{a.out}/loss_curves.png", dpi=130); plt.close(fig)
-
+ 
     predict_fn = lambda xn: predict_norm(model, xn, device)
     for t, (cache, meta) in enumerate(caches["test"]):
         outdir = a.out if len(caches["test"]) == 1 else f"{a.out}/test{t}"
