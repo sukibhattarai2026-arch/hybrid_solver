@@ -24,7 +24,7 @@ Usage:
   python riemann_mlp_baseline.py ... --mode separate --out results_separate
   python riemann_mlp_baseline.py --train cr1_dir0.h5 --inspect      # print HDF5 tree
 """
-import argparse, hashlib, json, os, queue, threading, time
+import argparse, collections, hashlib, json, os, queue, threading, time
 import h5py
 import numpy as np
 import torch
@@ -172,9 +172,40 @@ def build_cache(h5_path, cache_root, rebuild=False, skip_r=0):
     return cdir, meta
 
 
+_OPEN_MM = collections.OrderedDict()      # path -> open memmap (LRU)
+_OPEN_LOCK = threading.Lock()
+MAX_OPEN_FILES = 64                       # at most this many cache files are memory-mapped at once
+
+
+class LazyNpy:
+    """Row-sliceable view of a .npy cache file. The file is memory-mapped only when it is read, and at most
+    MAX_OPEN_FILES files are mapped at a time (LRU), so hundreds of CR caches do not exhaust the OS
+    open-file limit ("Too many open files")."""
+    def __init__(self, path, n):
+        self.path, self.n = path, n
+        arr = np.load(path, mmap_mode="r")
+        self.shape, self.dtype = (n,) + arr.shape[1:], arr.dtype
+        del arr
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        with _OPEN_LOCK:
+            mm = _OPEN_MM.get(self.path)
+            if mm is None:
+                mm = np.load(self.path, mmap_mode="r")
+                _OPEN_MM[self.path] = mm
+                while len(_OPEN_MM) > MAX_OPEN_FILES:
+                    _OPEN_MM.popitem(last=False)
+            else:
+                _OPEN_MM.move_to_end(self.path)
+        return mm[:self.n][idx]
+
+
 def open_cache(cdir, meta):
     n = meta["n"]
-    return tuple(np.load(os.path.join(cdir, f"{nm}.npy"), mmap_mode="r")[:n] for nm in ("X", "Y", "C", "I"))
+    return tuple(LazyNpy(os.path.join(cdir, f"{nm}.npy"), n) for nm in ("X", "Y", "C", "I"))
 
 
 # Preprocessing
@@ -660,6 +691,16 @@ def main():
         raise SystemExit("need --train, --val and --test (one dir_0 file per CR)")
     if a.inputs == "own" and a.mode != "separate":
         raise SystemExit("--inputs own only makes sense with --mode separate")
+
+    try:                                           # many CR files -> raise the open-file limit if allowed
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 65536 if hard == resource.RLIM_INFINITY else hard
+        if soft != resource.RLIM_INFINITY and soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            print(f"[sys] open-file limit raised {soft} -> {target}")
+    except (ImportError, ValueError, OSError) as e:
+        print(f"[sys] could not raise open-file limit: {e}")
 
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed); np.random.seed(a.seed)
