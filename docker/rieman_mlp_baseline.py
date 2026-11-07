@@ -66,12 +66,13 @@ def check_component_names(f):
         raise ValueError(f"component names differ from expected layout: {bad}")
 
 
-def build_cache(h5_path, cache_root, rebuild=False):
-    """Convert one Chombo file (level_0) to memmap-able .npy files. Returns (cache_dir, meta)."""
+def build_cache(h5_path, cache_root, rebuild=False, skip_r=0):
+    """Convert one Chombo file (level_0) to memmap-able .npy files. Returns (cache_dir, meta).
+    skip_r: drop the first skip_r radial layers (i < i_min + skip_r), e.g. 5 starts at the 6th radius."""
     st = os.stat(h5_path)
     tag = hashlib.md5(os.path.abspath(h5_path).encode()).hexdigest()[:8]
     stem = os.path.splitext(os.path.basename(h5_path))[0]
-    cdir = os.path.join(cache_root, f"{stem}_{tag}")
+    cdir = os.path.join(cache_root, f"{stem}_{tag}" + (f"_skip{skip_r}" if skip_r else ""))
     meta_path = os.path.join(cdir, "meta.json")
     if os.path.exists(meta_path) and not rebuild:
         meta = json.load(open(meta_path))
@@ -98,7 +99,8 @@ def build_cache(h5_path, cache_root, rebuild=False):
         else:
             offs = np.r_[0, np.cumsum((hi - lo + 1).prod(1) * ncomp)]
         ghi = hi.max(0)
-
+        i_start = int(lo[:, 0].min()) + skip_r                  # first radial index that is kept
+ 
         # per box: ghost width g, face extension, array dims in file, dims we keep
         plans = []
         for b in range(nb):
@@ -123,12 +125,12 @@ def build_cache(h5_path, cache_root, rebuild=False):
             g0, d0_, k0_ = plans[0]
             print(f"[cache] {nb} boxes; box0: ghost={g0}, file dims={d0_.tolist()}, kept dims={k0_.tolist()}")
         nmax = int(sum(int(np.prod(p[2])) for p in plans))
-
+ 
         mk = lambda name, shape, dt: np.lib.format.open_memmap(
             os.path.join(cdir, name + ".npy"), mode="w+", dtype=dt, shape=shape)
         Xm, Ym = mk("X", (nmax, 16), np.float32), mk("Y", (nmax, 8), np.float32)
         Cm, Im = mk("C", (nmax, 3), np.float64), mk("I", (nmax, 3), np.int32)
-
+ 
         p = 0
         for b in range(nb):
             g, d, keep = plans[b]
@@ -145,6 +147,7 @@ def build_cache(h5_path, cache_root, rebuild=False):
                 rows = arr.reshape(ncomp, -1).T
                 ok = (np.isfinite(rows).all(1) & (rows[:, 3] > 0) & (rows[:, 11] > 0)
                       & (rows[:, 7] > 0) & (rows[:, 15] > 0))        # rho, p > 0 both sides
+                ok &= (lo[b][0] + ii.ravel()) >= i_start                 # skip the first skip_r radii
                 m = int(ok.sum())
                 if m:
                     sel = rows[ok]
@@ -159,15 +162,14 @@ def build_cache(h5_path, cache_root, rebuild=False):
             mm.flush()
         del Xm, Ym, Cm, Im
         meta = dict(n=int(p), nmax=nmax, dropped=int(nmax - p),
-                    imin=int(lo[:, 0].min()), imax=int((lo[:, 0] + np.array([q[2][0] for q in plans]) - 1).max()),
+                    imin=i_start, imax=int((lo[:, 0] + np.array([q[2][0] for q in plans]) - 1).max()),
                     jmin=int(lo[:, 1].min()), jmax=int((lo[:, 1] + np.array([q[2][1] for q in plans]) - 1).max()),
                     kmin=int(lo[:, 2].min()), kmax=int((lo[:, 2] + np.array([q[2][2] for q in plans]) - 1).max()),
-                    src_size=st.st_size, src_mtime=st.st_mtime)
+                    skip_r=skip_r, src_size=st.st_size, src_mtime=st.st_mtime)
     json.dump(meta, open(meta_path, "w"))
     print(f"[cache] done: {meta['n']} valid rows ({meta['dropped']} dropped: non-finite or rho/p<=0), "
           f"{time.time() - t0:.0f}s")
     return cdir, meta
-
 
 def open_cache(cdir, meta):
     n = meta["n"]
