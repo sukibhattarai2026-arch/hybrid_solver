@@ -132,6 +132,7 @@ def build_cache(h5_path, cache_root, rebuild=False, skip_r=0):
         Cm, Im = mk("C", (nmax, 3), np.float64), mk("I", (nmax, 3), np.int32)
 
         p = 0
+        n_skip = n_bad = 0
         for b in range(nb):
             g, d, keep = plans[b]
             ncells = int(np.prod(d))
@@ -145,9 +146,11 @@ def build_cache(h5_path, cache_root, rebuild=False, skip_r=0):
                     pl = ds[s0:s0 + plane].reshape(d[1], d[0])
                     arr[c] = pl[g:g + keep[1], g:g + keep[0]]
                 rows = arr.reshape(ncomp, -1).T
-                ok = (np.isfinite(rows).all(1) & (rows[:, 3] > 0) & (rows[:, 11] > 0)
-                      & (rows[:, 7] > 0) & (rows[:, 15] > 0))        # rho, p > 0 both sides
-                ok &= (lo[b][0] + ii.ravel()) >= i_start                 # skip the first skip_r radii
+                valid = (np.isfinite(rows).all(1) & (rows[:, 3] > 0) & (rows[:, 11] > 0)
+                         & (rows[:, 7] > 0) & (rows[:, 15] > 0))     # rho, p > 0 both sides
+                in_r = (lo[b][0] + ii.ravel()) >= i_start             # skip the first skip_r radii
+                n_skip += int((~in_r).sum()); n_bad += int((in_r & ~valid).sum())
+                ok = valid & in_r
                 m = int(ok.sum())
                 if m:
                     sel = rows[ok]
@@ -161,14 +164,14 @@ def build_cache(h5_path, cache_root, rebuild=False, skip_r=0):
         for mm in (Xm, Ym, Cm, Im):
             mm.flush()
         del Xm, Ym, Cm, Im
-        meta = dict(n=int(p), nmax=nmax, dropped=int(nmax - p),
+        meta = dict(n=int(p), nmax=nmax, dropped=int(nmax - p), dropped_skip=n_skip, dropped_invalid=n_bad,
                     imin=i_start, imax=int((lo[:, 0] + np.array([q[2][0] for q in plans]) - 1).max()),
                     jmin=int(lo[:, 1].min()), jmax=int((lo[:, 1] + np.array([q[2][1] for q in plans]) - 1).max()),
                     kmin=int(lo[:, 2].min()), kmax=int((lo[:, 2] + np.array([q[2][2] for q in plans]) - 1).max()),
                     skip_r=skip_r, src_size=st.st_size, src_mtime=st.st_mtime)
     json.dump(meta, open(meta_path, "w"))
-    print(f"[cache] done: {meta['n']} valid rows ({meta['dropped']} dropped: non-finite or rho/p<=0), "
-          f"{time.time() - t0:.0f}s")
+    print(f"[cache] done: {meta['n']} rows kept; dropped {meta['dropped_skip']} by --skip_r, "
+          f"{meta['dropped_invalid']} invalid (non-finite or rho/p<=0); {time.time() - t0:.0f}s")
     return cdir, meta
 
 
@@ -308,10 +311,10 @@ def physical_flux_r(W, gamma=5 / 3, mu=1.0):
 # --------------------------------------------------------------------------- #
 def _mlp(n_in, n_out):
     return nn.Sequential(
-        nn.Linear(n_in, 128), nn.SiLU(),
-        nn.Linear(128, 128), nn.SiLU(),
-        nn.Linear(128, 128), nn.SiLU(),
-        nn.Linear(128, n_out),
+        nn.Linear(n_in, 256), nn.SiLU(),
+        nn.Linear(256, 256), nn.SiLU(),
+        nn.Linear(256, 256), nn.SiLU(),
+        nn.Linear(256, n_out),
     )
 
 
@@ -691,6 +694,12 @@ def main():
         raise SystemExit("need --train, --val and --test (one dir_0 file per CR)")
     if a.inputs == "own" and a.mode != "separate":
         raise SystemExit("--inputs own only makes sense with --mode separate")
+    for name in ("train", "val", "test"):
+        for path in getattr(a, name):
+            if not os.path.isfile(path):
+                hint = ("  (this looks like a Python list/Path repr passed as ONE argument: pass every file "
+                        "as its own argument)" if path.lstrip().startswith("[") or "PosixPath" in path else "")
+                raise SystemExit(f"ERROR: --{name} file not found: {path!r}{hint}")
 
     try:                                           # many CR files -> raise the open-file limit if allowed
         import resource
